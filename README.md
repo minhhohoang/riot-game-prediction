@@ -1,1 +1,1 @@
-# riot-game-prediction
+# League of Legends Game Predictions
