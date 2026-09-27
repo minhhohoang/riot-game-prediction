@@ -159,19 +159,27 @@ def extend_seed_players(
     return _normalise_seed_table(result)
 
 
-def load_player_match_index(processed_dir: Path, seed_players: pd.DataFrame) -> pd.DataFrame:
-    """Load the persistent index, migrating the old raw index if necessary."""
-    current_path = processed_dir / "player_match_index.csv"
+def load_player_match_index(
+    processed_dir: Path,
+    seed_players: pd.DataFrame,
+    stem: str = "player_match_index",
+) -> pd.DataFrame:
+    """Load a persistent index, migrating the old raw index when appropriate."""
+    current_path = processed_dir / f"{stem}.csv"
     legacy_path = processed_dir / "player_match_index_raw.csv"
-    source = current_path if current_path.exists() else legacy_path
+    source = current_path if current_path.exists() else legacy_path if stem == "player_match_index" else current_path
     return _normalise_index(_read_csv(source, INDEX_COLUMNS), seed_players)
 
 
-def save_player_match_index(index: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
+def save_player_match_index(
+    index: pd.DataFrame,
+    processed_dir: Path,
+    stem: str = "player_match_index",
+) -> pd.DataFrame:
     processed_dir.mkdir(parents=True, exist_ok=True)
     result = index.loc[:, INDEX_COLUMNS].drop_duplicates(["puuid", "match_id"], keep="first")
-    result.to_csv(processed_dir / "player_match_index.csv", index=False)
-    result.to_parquet(processed_dir / "player_match_index.parquet", index=False)
+    result.to_csv(processed_dir / f"{stem}.csv", index=False)
+    result.to_parquet(processed_dir / f"{stem}.parquet", index=False)
     return result
 
 
@@ -180,13 +188,24 @@ def append_match_histories(
     seed_players: pd.DataFrame,
     headers: dict,
     matches_per_player: int,
+    start_time: int | None = None,
+    end_time: int | None = None,
 ) -> pd.DataFrame:
-    """Fetch history IDs and append only new player-match relationships."""
+    """Fetch filtered history IDs and append only new player-match relationships."""
     new_rows: list[dict[str, str]] = []
     for number, seed in enumerate(seed_players.itertuples(index=False), start=1):
         url = f"https://{ROUTING}.api.riotgames.com/lol/match/v5/matches/by-puuid/{seed.puuid}/ids"
+        params = {
+            "queue": TARGET_QUEUE,
+            "start": 0,
+            "count": matches_per_player,
+        }
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
         try:
-            match_ids = riot_get(url, headers, {"queue": TARGET_QUEUE, "start": 0, "count": matches_per_player})
+            match_ids = riot_get(url, headers, params)
         except requests.HTTPError as error:
             print(f"History skipped for seed {number}/{len(seed_players)}: {error}")
             continue
