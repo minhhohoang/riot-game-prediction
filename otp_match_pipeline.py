@@ -33,7 +33,9 @@ DATASET_COLUMNS = [
     "match_id", "puuid", "seed_tier", "patch", "side", "lane", "champion",
     "opponent_champion", "opponent_puuid", "win", "game_duration",
     "game_start_timestamp", "champion_games", "player_games", "champion_share",
+    "otp_measure",
 ]
+HISTORY_COLUMNS = ["puuid", "match_id", "history_position", "history_exhausted"]
 UNIQUE_MATCHUP_COLUMNS = ["lane", "champion", "opponent_champion"]
 OPPONENT_INDEX_COLUMNS = ["opponent_puuid", "match_id"]
 OPPONENT_SPECIALIZATION_COLUMNS = [
@@ -178,8 +180,14 @@ def save_player_match_index(
 ) -> pd.DataFrame:
     processed_dir.mkdir(parents=True, exist_ok=True)
     result = index.loc[:, INDEX_COLUMNS].drop_duplicates(["puuid", "match_id"], keep="first")
-    result.to_csv(processed_dir / f"{stem}.csv", index=False)
-    result.to_parquet(processed_dir / f"{stem}.parquet", index=False)
+    csv_path = processed_dir / f"{stem}.csv"
+    parquet_path = processed_dir / f"{stem}.parquet"
+    csv_temp = processed_dir / f".{stem}.csv.tmp"
+    parquet_temp = processed_dir / f".{stem}.parquet.tmp"
+    result.to_csv(csv_temp, index=False)
+    csv_temp.replace(csv_path)
+    result.to_parquet(parquet_temp, index=False)
+    parquet_temp.replace(parquet_path)
     return result
 
 
@@ -190,32 +198,110 @@ def append_match_histories(
     matches_per_player: int,
     start_time: int | None = None,
     end_time: int | None = None,
+    checkpoint_dir: Path | None = None,
+    checkpoint_stem: str = "player_match_index",
+    checkpoint_every: int = 100,
 ) -> pd.DataFrame:
-    """Fetch filtered history IDs and append only new player-match relationships."""
+    """Fetch filtered history-ID pages for each seed; checkpoint when requested.
+
+    A Match-V5 history page contains at most 100 IDs. Continue until a page
+    is short so active players are not truncated to their newest 100 games.
+    IDs are not downloaded match payloads; a request failure can leave gaps.
+    """
+    if not 1 <= matches_per_player <= 100:
+        raise ValueError("matches_per_player must be between 1 and 100 (one API page)")
+    if checkpoint_dir is not None and checkpoint_every < 1:
+        raise ValueError("checkpoint_every must be positive")
+    result = index.loc[:, INDEX_COLUMNS].copy()
     new_rows: list[dict[str, str]] = []
     for number, seed in enumerate(seed_players.itertuples(index=False), start=1):
         url = f"https://{ROUTING}.api.riotgames.com/lol/match/v5/matches/by-puuid/{seed.puuid}/ids"
-        params = {
-            "queue": TARGET_QUEUE,
-            "start": 0,
-            "count": matches_per_player,
-        }
-        if start_time is not None:
-            params["startTime"] = start_time
-        if end_time is not None:
-            params["endTime"] = end_time
-        try:
-            match_ids = riot_get(url, headers, params)
-        except requests.HTTPError as error:
-            print(f"History skipped for seed {number}/{len(seed_players)}: {error}")
-            continue
-        new_rows.extend({"puuid": seed.puuid, "match_id": match_id, "seed_tier": seed.seed_tier} for match_id in match_ids)
-        print(f"Seed {number}/{len(seed_players)}: {len(match_ids)} history IDs")
+        offset = 0
+        player_ids = 0
+        while True:
+            params = {
+                "queue": TARGET_QUEUE,
+                "start": offset,
+                "count": matches_per_player,
+            }
+            if start_time is not None:
+                params["startTime"] = start_time
+            if end_time is not None:
+                params["endTime"] = end_time
+            try:
+                match_ids = riot_get(url, headers, params)
+            except requests.RequestException as error:
+                print(f"History page {offset} skipped for seed {number}/{len(seed_players)}: {error}")
+                break
+            new_rows.extend(
+                {"puuid": seed.puuid, "match_id": match_id, "seed_tier": seed.seed_tier}
+                for match_id in match_ids
+            )
+            player_ids += len(match_ids)
+            if len(match_ids) < matches_per_player:
+                break
+            offset += matches_per_player
+            time.sleep(0.1)
+        print(f"Seed {number}/{len(seed_players)}: {player_ids} history IDs")
         time.sleep(0.1)
-    new_index = pd.DataFrame(new_rows, columns=INDEX_COLUMNS)
-    return pd.concat([index, new_index], ignore_index=True).drop_duplicates(
-        ["puuid", "match_id"], keep="first"
-    ).reset_index(drop=True)
+        if checkpoint_dir is not None and number % checkpoint_every == 0:
+            result = pd.concat(
+                [result, pd.DataFrame(new_rows, columns=INDEX_COLUMNS)], ignore_index=True
+            ).drop_duplicates(["puuid", "match_id"], keep="first")
+            result = save_player_match_index(result, checkpoint_dir, checkpoint_stem)
+            new_rows.clear()
+    result = pd.concat(
+        [result, pd.DataFrame(new_rows, columns=INDEX_COLUMNS)], ignore_index=True
+    ).drop_duplicates(["puuid", "match_id"], keep="first")
+    return result.reset_index(drop=True)
+
+
+def cached_patch_history_coverage(
+    patch_index: pd.DataFrame,
+    raw_match_dir: Path,
+    target_patch: str,
+    history_page_size: int = 100,
+) -> tuple[pd.DataFrame, set[str]]:
+    """Compare indexed IDs since patch start with usable cached patch games.
+
+    Returns player coverage plus the distinct cached patch/queue match IDs.
+    The index is an upper-bound denominator if the configured start time
+    precedes the patch; a one-page history request may also miss older games.
+    """
+    relationships = patch_index.loc[:, ["puuid", "match_id"]].dropna().drop_duplicates()
+    ids_by_match = relationships.groupby("match_id")["puuid"].agg(set).to_dict()
+    cached_patch_ids: set[str] = set()
+    covered_pairs: list[tuple[str, str]] = []
+    for match_id, expected_puuids in ids_by_match.items():
+        path = raw_match_dir / f"{match_id}.json"
+        if not path.exists():
+            continue
+        try:
+            with path.open(encoding="utf-8") as file:
+                match = json.load(file)
+            if patch_from_match(match) != target_patch or match["info"].get("queueId") != TARGET_QUEUE:
+                continue
+            participants = match["info"].get("participants", [])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        cached_patch_ids.add(match_id)
+        covered_pairs.extend(
+            (participant["puuid"], match_id)
+            for participant in participants
+            if participant.get("puuid") in expected_puuids and participant.get("championName")
+        )
+
+    indexed = relationships.groupby("puuid").size().rename("indexed_since_start")
+    covered = pd.DataFrame(covered_pairs, columns=["puuid", "match_id"])
+    if covered.empty:
+        coverage_counts = pd.Series(dtype="int64", name="cached_usable_patch_games")
+    else:
+        coverage_counts = covered.drop_duplicates().groupby("puuid").size().rename("cached_usable_patch_games")
+    summary = indexed.to_frame().join(coverage_counts).fillna({"cached_usable_patch_games": 0})
+    summary["cached_usable_patch_games"] = summary["cached_usable_patch_games"].astype(int)
+    summary["indexed_cache_coverage"] = summary["cached_usable_patch_games"] / summary["indexed_since_start"]
+    summary["at_or_above_page_size"] = summary["indexed_since_start"] >= history_page_size
+    return summary.reset_index(), cached_patch_ids
 
 
 def download_missing_matches(
@@ -223,12 +309,19 @@ def download_missing_matches(
     raw_match_dir: Path,
     headers: dict,
     max_new_downloads: int,
+    target_patch: str | None = None,
+    selection_seed: int | None = None,
+    progress_every: int = 1,
 ) -> tuple[int, int, int]:
     """Save only missing Match-V5 payloads in a round-robin tier order.
 
-    Existing files never count toward the cap. A match associated with multiple
-    seed tiers can appear in multiple tier queues, but is scheduled and fetched
-    only once.
+    Existing files never count toward the cap. If target_patch is provided,
+    only newly saved Solo/Duo matches on that patch count toward it. Other
+    responses are still cached so they will not be repeatedly downloaded.
+    A match associated with multiple seed tiers is fetched only once.
+    When a selection seed is supplied, shuffle candidate IDs within each
+    tier before round-robin scheduling. This includes newly discovered games
+    without systematically favoring IDs from an older saved index.
     """
     raw_match_dir.mkdir(parents=True, exist_ok=True)
     match_ids = index["match_id"].dropna().drop_duplicates().tolist()
@@ -244,15 +337,18 @@ def download_missing_matches(
     tier_order = ["master", "grandmaster", "challenger"]
     other_tiers = [tier for tier in tiered_index["seed_tier"].unique() if tier not in tier_order]
     tier_order.extend(other_tiers)
-    tier_queues = {
-        tier: deque(
+    rng = random.Random(selection_seed) if selection_seed is not None else None
+    tier_queues = {}
+    for tier in tier_order:
+        tier_ids = [
             match_id for match_id in tiered_index.loc[
                 tiered_index["seed_tier"] == tier, "match_id"
             ].drop_duplicates()
             if match_id in missing_set
-        )
-        for tier in tier_order
-    }
+        ]
+        if rng is not None:
+            rng.shuffle(tier_ids)
+        tier_queues[tier] = deque(tier_ids)
 
     # One pass selects at most one new match from each tier. Shared matches are
     # skipped in later queues, so every Match-V5 payload still has one download.
@@ -283,7 +379,7 @@ def download_missing_matches(
         url = f"https://{ROUTING}.api.riotgames.com/lol/match/v5/matches/{match_id}"
         try:
             payload = riot_get(url, headers)
-        except requests.HTTPError as error:
+        except requests.RequestException as error:
             print(f"Match skipped ({match_id}): {error}")
             continue
         final_path = raw_match_dir / f"{match_id}.json"
@@ -291,8 +387,15 @@ def download_missing_matches(
         with temporary_path.open("w", encoding="utf-8") as file:
             json.dump(payload, file)
         temporary_path.replace(final_path)
-        downloads += 1
-        print(f"New downloads this run: {downloads}/{max_new_downloads} ({match_id})")
+        if target_patch is None or (
+            payload.get("info", {}).get("queueId") == TARGET_QUEUE
+            and patch_from_match(payload) == target_patch
+        ):
+            downloads += 1
+            if downloads % progress_every == 0 or downloads == max_new_downloads:
+                print(f"New qualifying downloads this run: {downloads}/{max_new_downloads} ({match_id})")
+        else:
+            print(f"Cached {match_id}, but excluded from the {target_patch} Solo/Duo target")
         time.sleep(0.1)
     return len(cached_ids), len(missing_ids), downloads
 
@@ -300,21 +403,18 @@ def download_missing_matches(
 def build_otp_dataset(index: pd.DataFrame, raw_match_dir: Path, target_patch: str) -> tuple[pd.DataFrame, int]:
     """Build one role-matched observation for each indexed seed-player appearance.
 
-    Champion usage is calculated from every usable cached target-patch game for
-    a seed player before any game is excluded for a missing or ambiguous role
-    matchup. This makes specialization independent of role-data quality.
+    Build candidate patch observations. Attach pre-game champion usage separately,
+    after retrieving the ordered prior-game IDs and their match payloads.
     """
     index = index.loc[:, INDEX_COLUMNS].drop_duplicates(["puuid", "match_id"], keep="first")
     seeds_by_match = index.groupby("match_id")[["puuid", "seed_tier"]].apply(
         lambda group: group.to_dict("records")
     ).to_dict()
-    usable_games: list[dict] = []
     observations: list[dict] = []
     unreadable_files = 0
-    for path in sorted(raw_match_dir.glob("*.json")):
-        match_id = path.stem
-        seed_rows = seeds_by_match.get(match_id)
-        if not seed_rows:
+    for match_id, seed_rows in seeds_by_match.items():
+        path = raw_match_dir / f"{match_id}.json"
+        if not path.exists():
             continue
         try:
             with path.open(encoding="utf-8") as file:
@@ -324,21 +424,15 @@ def build_otp_dataset(index: pd.DataFrame, raw_match_dir: Path, target_patch: st
         except (OSError, ValueError, KeyError, TypeError):
             unreadable_files += 1
             continue
-        if patch != target_patch:
+        if patch != target_patch or info.get("queueId") != TARGET_QUEUE:
             continue
         participants = info.get("participants", [])
         by_puuid = {participant.get("puuid"): participant for participant in participants}
         for seed in seed_rows:
             player = by_puuid.get(seed["puuid"])
             champion = player.get("championName") if player else None
-            if player and champion:
-                usable_games.append({
-                    "match_id": match_id,
-                    "puuid": seed["puuid"],
-                    "champion": champion,
-                })
             role = ROLE_MAP.get(player.get("teamPosition", "")) if player else None
-            if not player or not role or player.get("teamId") not in (100, 200):
+            if not player or not champion or not role or player.get("teamId") not in (100, 200):
                 continue
             opponents = [
                 participant for participant in participants
@@ -363,19 +457,192 @@ def build_otp_dataset(index: pd.DataFrame, raw_match_dir: Path, target_patch: st
                 "game_start_timestamp": info.get("gameStartTimestamp"),
             })
     dataset = pd.DataFrame(observations)
-    if dataset.empty or not usable_games:
+    if dataset.empty:
         return pd.DataFrame(columns=DATASET_COLUMNS), unreadable_files
-    usage = pd.DataFrame(usable_games).drop_duplicates(["puuid", "match_id"], keep="first")
-    usage["champion_games"] = usage.groupby(["puuid", "champion"])["match_id"].transform("size")
-    usage["player_games"] = usage.groupby("puuid")["match_id"].transform("size")
-    usage["champion_share"] = usage["champion_games"] / usage["player_games"]
-    dataset = dataset.merge(
-        usage[["match_id", "puuid", "champion_games", "player_games", "champion_share"]],
-        on=["match_id", "puuid"],
-        how="left",
-        validate="one_to_one",
-    )
+    for column in ("champion_games", "player_games", "champion_share", "otp_measure"):
+        dataset[column] = pd.NA
     return dataset.loc[:, DATASET_COLUMNS].sort_values(["game_start_timestamp", "match_id", "puuid"]).reset_index(drop=True), unreadable_files
+
+
+def load_pregame_history_index(processed_dir: Path) -> pd.DataFrame:
+    """Ordered, completed history requests; positions run newest to oldest."""
+    path = processed_dir / "pregame_history_index_16_19.csv"
+    frame = _read_csv(path, HISTORY_COLUMNS)
+    if frame.empty:
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+    missing = set(HISTORY_COLUMNS).difference(frame.columns)
+    if missing:
+        raise ValueError(f"Pre-game history index is missing columns: {sorted(missing)}")
+    frame = frame.loc[:, HISTORY_COLUMNS].copy()
+    frame["history_position"] = pd.to_numeric(frame["history_position"], errors="raise").astype(int)
+    frame["history_exhausted"] = frame["history_exhausted"].astype(str).str.lower().eq("true")
+    if frame.duplicated(["puuid", "match_id"]).any() or frame.duplicated(["puuid", "history_position"]).any():
+        raise ValueError("The pre-game history index contains duplicate player IDs or positions")
+    return frame
+
+
+def save_pregame_history_index(frame: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    path = processed_dir / "pregame_history_index_16_19.csv"
+    temporary = processed_dir / ".pregame_history_index_16_19.csv.tmp"
+    frame.loc[:, HISTORY_COLUMNS].to_csv(temporary, index=False)
+    temporary.replace(path)
+    return frame
+
+
+def append_pregame_histories(
+    index: pd.DataFrame,
+    observations: pd.DataFrame,
+    headers: dict,
+    processed_dir: Path,
+    prior_games: int = 50,
+    page_size: int = 100,
+    checkpoint_every: int = 25,
+) -> pd.DataFrame:
+    """Get ordered Solo/Duo IDs through 50 games before each player's earliest observation.
+
+    Save only completed requests for each player. On reruns reuse a completed
+    history if it still covers every current observation and its prior window.
+    An interrupted player's old index is retained and can be refreshed later.
+    """
+    if not 1 <= page_size <= 100 or prior_games < 1 or checkpoint_every < 1:
+        raise ValueError("Invalid history page size, window, or checkpoint interval")
+    required = observations.groupby("puuid")["match_id"].agg(set).to_dict()
+    saved = {puuid: group.copy() for puuid, group in index.groupby("puuid", sort=False)}
+    changed = 0
+    for number, (puuid, target_ids) in enumerate(required.items(), 1):
+        old = saved.get(puuid)
+        if old is not None and not old.empty:
+            old = old.sort_values("history_position")
+            locations = dict(zip(old["match_id"], old["history_position"]))
+            if target_ids.issubset(locations) and (
+                len(old) > max(locations[match_id] for match_id in target_ids) + prior_games
+                or bool(old["history_exhausted"].iloc[0])
+            ):
+                continue
+        match_ids: list[str] = []
+        completed = False
+        exhausted = False
+        url = f"https://{ROUTING}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids"
+        for offset in range(0, 10000, page_size):
+            try:
+                page = riot_get(url, headers, {"queue": TARGET_QUEUE, "start": offset, "count": page_size})
+            except requests.RequestException as error:
+                print(f"Pre-game history skipped for player {number}/{len(required)}: {error}")
+                break
+            if not isinstance(page, list) or len(page) > page_size or len(set(page)) != len(page):
+                raise ValueError(f"Unexpected match-history response for player {number}")
+            match_ids.extend(page)
+            if len(set(match_ids)) != len(match_ids):
+                raise ValueError(f"Duplicate IDs across match-history pages for player {number}")
+            exhausted = len(page) < page_size
+            positions = {match_id: position for position, match_id in enumerate(match_ids)}
+            if target_ids.issubset(positions) and (
+                len(match_ids) > max(positions[match_id] for match_id in target_ids) + prior_games
+                or exhausted
+            ):
+                completed = True
+                break
+            if exhausted:
+                # Missing target IDs cannot be used to construct an exact window.
+                break
+            time.sleep(0.1)
+        if not completed:
+            print(f"Incomplete pre-game history for player {number}/{len(required)}; retry on resume")
+            continue
+        saved[puuid] = pd.DataFrame({
+            "puuid": puuid, "match_id": match_ids,
+            "history_position": range(len(match_ids)), "history_exhausted": exhausted,
+        })
+        changed += 1
+        if changed % checkpoint_every == 0:
+            save_pregame_history_index(pd.concat(saved.values(), ignore_index=True), processed_dir)
+            print(f"Pre-game histories checkpointed: {changed:,}/{len(required):,} players refreshed")
+        time.sleep(0.1)
+    result = pd.concat(saved.values(), ignore_index=True) if saved else pd.DataFrame(columns=HISTORY_COLUMNS)
+    return save_pregame_history_index(result, processed_dir)
+
+
+def pregame_required_ids(
+    observations: pd.DataFrame, history_index: pd.DataFrame, prior_games: int = 50,
+) -> set[str]:
+    """Return only the prior match IDs needed for observed player-games."""
+    required: set[str] = set()
+    targets = observations.groupby("puuid")["match_id"].agg(set).to_dict()
+    for puuid, group in history_index.groupby("puuid", sort=False):
+        if puuid not in targets:
+            continue
+        ids = group.sort_values("history_position")["match_id"].tolist()
+        positions = {match_id: position for position, match_id in enumerate(ids)}
+        for match_id in targets[puuid]:
+            position = positions.get(match_id)
+            if position is not None and len(ids) >= position + prior_games + 1:
+                required.update(ids[position + 1:position + prior_games + 1])
+    return required
+
+
+def attach_pregame_usage(
+    observations: pd.DataFrame,
+    history_index: pd.DataFrame,
+    raw_match_dir: Path,
+    prior_games: int = 50,
+) -> pd.DataFrame:
+    """Count current champion in the 50 completed Solo/Duo games before each match.
+
+    A missing or unreadable earlier game invalidates the entire window. No
+    current game or future game is ever counted in champion_share.
+    """
+    if observations.empty:
+        return observations.copy()
+    result = observations.drop(columns=["champion_games", "player_games", "champion_share", "otp_measure"]).copy()
+    ordered = {
+        puuid: group.sort_values("history_position")["match_id"].tolist()
+        for puuid, group in history_index.groupby("puuid", sort=False)
+    }
+    positions = {puuid: {match_id: i for i, match_id in enumerate(ids)} for puuid, ids in ordered.items()}
+    targets = observations.groupby("puuid")["match_id"].agg(set).to_dict()
+    needed_by_id: dict[str, set[str]] = {}
+    for puuid, target_ids in targets.items():
+        ids = ordered.get(puuid, [])
+        for target in target_ids:
+            position = positions.get(puuid, {}).get(target)
+            if position is not None and len(ids) >= position + prior_games + 1:
+                for older_id in ids[position + 1:position + prior_games + 1]:
+                    needed_by_id.setdefault(older_id, set()).add(puuid)
+    matches: dict[tuple[str, str], tuple[str, int, int]] = {}
+    for match_id, puuids in needed_by_id.items():
+        try:
+            with (raw_match_dir / f"{match_id}.json").open(encoding="utf-8") as file:
+                info = json.load(file)["info"]
+            if info.get("queueId") != TARGET_QUEUE:
+                continue
+            start = int(info["gameStartTimestamp"])
+            end = int(info.get("gameEndTimestamp") or (start + int(info["gameDuration"]) * 1000))
+            for player in info["participants"]:
+                if player.get("puuid") in puuids and player.get("championName"):
+                    matches[(player["puuid"], match_id)] = (player["championName"], start, end)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    champion_games: list[int | None] = []
+    for row in result.itertuples(index=False):
+        ids = ordered.get(row.puuid, [])
+        position = positions.get(row.puuid, {}).get(row.match_id)
+        if position is None or len(ids) < position + prior_games + 1 or pd.isna(row.game_start_timestamp):
+            champion_games.append(None)
+            continue
+        window = [matches.get((row.puuid, match_id)) for match_id in ids[position + 1:position + prior_games + 1]]
+        # Require all 50 payloads, correct player, and completion before kickoff.
+        if any(game is None or game[2] > int(row.game_start_timestamp) for game in window):
+            champion_games.append(None)
+        else:
+            champion_games.append(sum(game[0] == row.champion for game in window))
+    result["champion_games"] = pd.array(champion_games, dtype="Int64")
+    result["player_games"] = pd.array(
+        [prior_games if games is not None else None for games in champion_games], dtype="Int64"
+    )
+    result["champion_share"] = result["champion_games"] / result["player_games"]
+    result["otp_measure"] = "previous_50_ranked_solo"
+    return result.loc[:, DATASET_COLUMNS]
 
 
 def save_otp_dataset(dataset: pd.DataFrame, processed_dir: Path, target_patch: str) -> None:

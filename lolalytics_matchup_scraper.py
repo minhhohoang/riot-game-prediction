@@ -15,7 +15,7 @@ import json
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
@@ -52,6 +52,7 @@ OUTPUT_COLUMNS = KEY_COLUMNS + [
     "source_url",
     "error",
     "scraped_at_utc",
+    "snapshot_id",
 ]
 TERMINAL_STATUSES = {"ok", "no_data"}
 
@@ -333,8 +334,23 @@ def collect_expected_matchups(
     rank: str = "d2_plus",
     regions: tuple[str, ...] = ("global",),
     delay_seconds: float = 1.25,
+    refresh_snapshot: str | None = None,
 ) -> pd.DataFrame:
-    """Collect and persist every unfinished matchup-region lookup."""
+    """Collect missing lookups, optionally refreshing each key once per snapshot.
+
+    Pass an explicit YYYY-MM-DD ``refresh_snapshot`` to fetch even previously
+    completed keys. Each successful/no-data result gets that snapshot ID in the
+    append-only checkpoint, so rerunning after interruption skips those keys.
+    Without a snapshot ID, the original resume/skip behavior is preserved.
+    """
+    if refresh_snapshot is not None:
+        try:
+            valid_date = date.fromisoformat(refresh_snapshot)
+        except (TypeError, ValueError) as error:
+            raise ValueError("refresh_snapshot must be YYYY-MM-DD or None.") from error
+        if valid_date.isoformat() != refresh_snapshot:
+            raise ValueError("refresh_snapshot must be YYYY-MM-DD or None.")
+
     matchups = load_unique_matchups(unique_matchups_path)
     stem = f"expected_matchups_{str(patch).replace('.', '_')}"
     checkpoint_path = processed_dir / f"{stem}_checkpoint.jsonl"
@@ -358,13 +374,31 @@ def collect_expected_matchups(
                 }
             )
 
+    required_keys = {_row_key(task) for task in tasks}
+    if refresh_snapshot is not None:
+        newer = [
+            key for key in required_keys
+            if key in latest and str(latest[key].get("snapshot_id") or "") > refresh_snapshot
+        ]
+        if newer:
+            raise ValueError(
+                f"{len(newer):,} required lookups have a newer snapshot than "
+                f"{refresh_snapshot}. Choose that date or a later date."
+            )
     completed = {
-        key for key, row in latest.items() if row.get("status") in TERMINAL_STATUSES
+        key for key in required_keys
+        if key in latest
+        and latest[key].get("status") in TERMINAL_STATUSES
+        and (
+            refresh_snapshot is None
+            or latest[key].get("snapshot_id") == refresh_snapshot
+        )
     }
     remaining = [task for task in tasks if _row_key(task) not in completed]
     print(f"Required matchup-region lookups: {len(tasks):,}")
-    print(f"Completed checkpoint rows retained: {len(completed):,}")
-    print(f"Lookups remaining: {len(remaining):,}")
+    print(f"Refresh snapshot: {refresh_snapshot or 'off (new/error keys only)'}")
+    print(f"Completed for this run: {len(completed):,}")
+    print(f"Requests planned: {len(remaining):,}")
 
     session = create_session()
 
@@ -373,6 +407,7 @@ def collect_expected_matchups(
             base_row = {
                 **task,
                 "scraped_at_utc": datetime.now(timezone.utc).isoformat(),
+                "snapshot_id": refresh_snapshot,
             }
             try:
                 source_url, parsed = scrape_one_matchup(
@@ -407,6 +442,16 @@ def collect_expected_matchups(
         print("Collection interrupted; completed checkpoint rows are safe.")
     finally:
         result = export_results(latest.values(), output_csv, output_parquet)
+        if refresh_snapshot is not None:
+            unfinished = sum(
+                key not in latest
+                or latest[key].get("status") not in TERMINAL_STATUSES
+                or latest[key].get("snapshot_id") != refresh_snapshot
+                for key in required_keys
+            )
+            print(f"Snapshot {refresh_snapshot}: {unfinished:,} lookups unfinished.")
+            if unfinished:
+                print("Resume this snapshot before running the final merge.")
 
     return result
 
