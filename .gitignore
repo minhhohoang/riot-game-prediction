@@ -219,3 +219,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Version 2 longitudinal raw data, processed exports, and resumable state
+/hlr_model/data/
+# Ignore secrets in relocated experiment directories as well
+**/.env
+**/.env.*
+!**/.env.example
