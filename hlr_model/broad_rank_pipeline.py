@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -25,7 +26,7 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 from hlr_model.longitudinal_pipeline import Config, RECORD_COLUMNS, player_record, expanding_features, quality_report
-from hlr_model.riot_api_helpers import AuthenticationError, CollectionDisabled, MatchStore
+from hlr_model.riot_api_helpers import AuthenticationError, CollectionDisabled
 
 TIERS=('BRONZE','SILVER','GOLD','PLATINUM','EMERALD','DIAMOND')
 DIVISIONS=('I','II','III','IV')
@@ -34,6 +35,17 @@ SCHEMA=1
 
 class ContractError(RuntimeError):
     """Schema/request mismatch: stop with work pending, never exclude a player."""
+
+class MatchContractError(ContractError):
+    """Only allowlisted field paths, types and conditions; never response values."""
+    def __init__(self,mid,issues):
+        self.diagnostics={'match_id':mid,'issues':issues}
+        fields='; '.join(f"{x['field']}: {x['actual_type']}"+
+            (f" length={x['length']}" if 'length' in x else '')+f" (expected {x['expected']})" for x in issues)
+        super().__init__(f'Match {mid} is unusable: {fields}. Work remains pending.')
+
+class AbortedMatch(RuntimeError):
+    """A verified pre-start abort has no player outcome; never a failed fetch."""
 
 class FrameExhausted(RuntimeError):pass
 
@@ -204,6 +216,85 @@ def valid_entries(value):
         and isinstance(x.get('queueType'),str) and isinstance(x.get('tier'),str) and isinstance(x.get('rank'),str) for x in value)
 def valid_ids(value,count):return isinstance(value,list) and len(value)<=count and all(match_id(x) for x in value)
 
+def aborted_before_start(payload,mid,uid):
+    """Recognize only the observed Match-V5 Abort_Unexpected non-game shape.
+
+    Empty/partial normal games, other abort reasons, missing fields and mismatched
+    identity remain contract failures. Never infer an outcome or timestamp.
+    """
+    if not isinstance(payload,dict):return False
+    meta=payload.get('metadata');info=payload.get('info')
+    if not isinstance(meta,dict) or not isinstance(info,dict):return False
+    ids=meta.get('participants')
+    return (meta.get('matchId')==mid and isinstance(ids,list) and len(ids)==10
+        and all(isinstance(x,str) and bool(x) for x in ids) and len(set(ids))==10 and uid in ids
+        and info.get('endOfGameResult')=='Abort_Unexpected'
+        and info.get('participants')==[] and info.get('gameVersion')==''
+        and type(info.get('gameStartTimestamp')) is int and info['gameStartTimestamp']==0
+        and type(info.get('gameDuration')) is int and info['gameDuration']==0
+        and type(info.get('gameEndTimestamp')) is int and info['gameEndTimestamp']>0
+        and type(info.get('queueId')) is int)
+
+def match_issues(payload,mid,uid=None):
+    """Explain the match/record contract without logging values, IDs or headers.
+
+    Diagnostics must not include arbitrary JSON keys, exception messages, URLs,
+    or response snippets: even a malformed response could echo credentials.
+    """
+    issues=[]
+    def check(ok,field,value,expected,*,present=True):
+        if not ok:
+            issue={'field':field,'actual_type':type(value).__name__ if present else 'missing','expected':expected}
+            if isinstance(value,(str,list,dict)):issue['length']=len(value)
+            issues.append(issue)
+        return ok
+    def field(obj,name,path,predicate,expected):
+        value=obj.get(name)
+        return check(predicate(value),path,value,expected,present=name in obj)
+    def number(x):return type(x) is int or (type(x) is float and math.isfinite(x))
+    if not check(isinstance(payload,dict),'response',payload,'object'):return issues
+    for name in ('metadata','info'):
+        field(payload,name,name,lambda x:isinstance(x,dict),'object')
+    if issues:return issues
+    metadata=payload['metadata'];info=payload['info']
+    field(metadata,'matchId','metadata.matchId',lambda x:x==mid,'requested match ID')
+    field(info,'gameVersion','info.gameVersion',lambda x:isinstance(x,str) and bool(x),'nonempty string')
+    if not field(info,'participants','info.participants',lambda x:isinstance(x,list),'list'):return issues
+    ps=info['participants']
+    check(len(ps)==10,'info.participants',ps,'10 participants')
+    for i,p in enumerate(ps):
+        if check(isinstance(p,dict),f'info.participants[{i}]',p,'object'):
+            field(p,'puuid',f'info.participants[{i}].puuid',lambda x:isinstance(x,str) and bool(x),'nonempty string')
+    ids=[p.get('puuid') for p in ps if isinstance(p,dict)]
+    ids_valid=len(ids)==len(ps) and all(isinstance(x,str) and x for x in ids)
+    if ids_valid:check(len(set(ids))==10,'info.participants[].puuid',ids,'10 unique PUUIDs')
+    mids=metadata.get('participants')
+    if field(metadata,'participants','metadata.participants',lambda x:isinstance(x,list) and all(isinstance(i,str) for i in x),'list of PUUID strings') and ids_valid:
+        check(set(mids)==set(ids),'metadata.participants',mids,'same PUUID set as info.participants')
+    if uid is None:return issues
+    start=info.get('gameStartTimestamp');end=info.get('gameEndTimestamp')
+    start_ok=field(info,'gameStartTimestamp','info.gameStartTimestamp',lambda x:number(x) and x>0,'positive finite timestamp')
+    if end is None:
+        field(info,'gameDuration','info.gameDuration',lambda x:number(x) and x>0,'positive finite duration when end timestamp is absent')
+    else:
+        field(info,'gameEndTimestamp','info.gameEndTimestamp',lambda x:number(x) and (not start_ok or x>=start),'finite timestamp >= gameStartTimestamp')
+    if not ids_valid:return issues
+    focal=[(i,p) for i,p in enumerate(ps) if p['puuid']==uid]
+    if not check(len(focal)==1,'info.participants[].puuid',ids,'exactly one focal player'):return issues
+    i,p=focal[0];prefix=f'info.participants[{i}].'
+    field(p,'championName',prefix+'championName',lambda x:isinstance(x,str) and bool(x),'nonempty string')
+    field(p,'championId',prefix+'championId',lambda x:type(x) is int,'integer')
+    field(p,'win',prefix+'win',lambda x:isinstance(x,bool),'boolean')
+    field(p,'teamId',prefix+'teamId',lambda x:type(x) is int and x in (100,200),'100 or 200')
+    field(info,'queueId','info.queueId',lambda x:type(x) is int,'integer')
+    if not issues:
+        # Optional nested fields can also make projection unusable. Do not echo
+        # exception text, which may contain data controlled by the response.
+        try:record=player_record(payload,uid)
+        except (TypeError,ValueError,KeyError,AttributeError,OverflowError):record=None
+        check(record is not None,'player_record',payload,'convertible player record (including optional role/perks fields)')
+    return issues
+
 def master_ids(project):
     checkpoint=Path(project)/'hlr_model/data/runs/patch_16_19_seed_1619/metadata/checkpoint.json'
     if not checkpoint.is_file():raise ValueError('Cannot locate the existing Master cohort checkpoint; supply explicit excluded_players for a fixture or locate it before enabling collection.')
@@ -293,9 +384,13 @@ class BroadCollector:
         self.state['candidate_order']=order;self.state['frame_frozen_at']=utc(self.clock());self.save()
     @staticmethod
     def valid_match(payload,mid):
-        if not MatchStore.valid(payload,mid):return False
-        ps=payload['info']['participants'];ids=[p.get('puuid') for p in ps]
-        return len(ps)==10 and len(set(ids))==10 and None not in ids and set(payload['metadata'].get('participants',[]))==set(ids)
+        return not match_issues(payload,mid)
+    @staticmethod
+    def validate_record(payload,mid,uid):
+        if aborted_before_start(payload,mid,uid):return True
+        issues=match_issues(payload,mid,uid)
+        if issues:raise MatchContractError(mid,issues)
+        return True
     def record(self,mid,uid,download=False):
         if not match_id(mid):raise ContractError('Invalid NA match ID.')
         for root in self.roots:
@@ -303,16 +398,21 @@ class BroadCollector:
             if not path.is_file():continue
             try:
                 with path.open() as f:payload=json.load(f)
-                if self.valid_match(payload,mid):
+                if aborted_before_start(payload,mid,uid):
+                    self.metrics['raw_cache_hits']+=1
+                    if not download:return None
+                    raise AbortedMatch(mid)
+                if not match_issues(payload,mid,uid):
                     record=player_record(payload,uid)
                     if record is not None:self.metrics['raw_cache_hits']+=1;return record
             except (OSError,ValueError,TypeError,KeyError):pass
         if not download:return None
         payload,_=self.client.request('americas',f'/lol/match/v5/matches/{mid}',method='match_detail',
-            validate=lambda p:self.valid_match(p,mid) and player_record(p,uid) is not None,cache=False)
+            validate=lambda p:self.validate_record(p,mid,uid),cache=False)
         path=self.roots[0]/f'{mid}.json'
         if path.exists():path.rename(path.with_name(path.name+f'.invalid-{time.time_ns()}'))
         atomic_write(path,payload);self.metrics['new_raw_matches']+=1
+        if aborted_before_start(payload,mid,uid):raise AbortedMatch(mid)
         return player_record(payload,uid)
     def query(self,player,stage):
         config=self.config.study
@@ -339,11 +439,15 @@ class BroadCollector:
         p.setdefault('target_ids',[]);p.setdefault('target_checked',[]);p.setdefault('target_exclusions',{})
         for mid in q['ids']:
             # Reconcile even checked files: never trust statuses over missing/corrupt payloads.
-            r=self.record(mid,p['puuid'],download=True)
-            if r['queue']!=self.config.study.queue:reason='wrong_queue'
-            elif r['patch']!=self.config.study.target_patch:reason='wrong_patch'
-            elif not self.config.study.target_search_start*1000<=r['timestamp']<self.config.study.target_search_end*1000:reason='outside_target_window'
-            else:reason=None
+            try:r=self.record(mid,p['puuid'],download=True)
+            except AbortedMatch:
+                reason='aborted_before_start'
+                self.status(f'Match {mid}: verified Abort_Unexpected before start; participants=list length=0, gameVersion=str length=0, gameStartTimestamp=int zero, gameDuration=int zero; excluded as a non-game.')
+            else:
+                if r['queue']!=self.config.study.queue:reason='wrong_queue'
+                elif r['patch']!=self.config.study.target_patch:reason='wrong_patch'
+                elif not self.config.study.target_search_start*1000<=r['timestamp']<self.config.study.target_search_end*1000:reason='outside_target_window'
+                else:reason=None
             if mid not in p['target_checked']:
                 p['target_checked'].append(mid)
                 if reason:p['target_exclusions'][reason]=p['target_exclusions'].get(reason,0)+1
@@ -364,7 +468,11 @@ class BroadCollector:
             q,page,count=self.query(p,'history')
             while q['page_index']<len(page):
                 mid=page[q['page_index']]
-                r=self.record(mid,p['puuid'],download=True)
+                try:r=self.record(mid,p['puuid'],download=True)
+                except AbortedMatch:
+                    self.status(f'Match {mid}: verified Abort_Unexpected before start; participants=list length=0, gameVersion=str length=0, gameStartTimestamp=int zero, gameDuration=int zero; excluded as a non-game.')
+                    p['history_exclusions']['aborted_before_start']=p['history_exclusions'].get('aborted_before_start',0)+1
+                    q['page_index']+=1;self.save();continue
                 if r['timestamp']<self.config.study.season_start*1000:stop='season_boundary_reached'
                 elif r['queue']!=self.config.study.queue:reason='wrong_queue'
                 elif r['timestamp']>=p['anchor_timestamp'] or r['end_timestamp']>=p['anchor_timestamp']:reason='not_completed_before_anchor'
@@ -446,7 +554,9 @@ class BroadCollector:
             except BaseException as error:
                 if current is not None and current['status'] not in ('excluded','completed'):current['status']='incomplete'
                 # Never serialize exception text: requests exceptions may contain URLs/headers.
-                self.state['failures'].append({'type':type(error).__name__,'stage':self.state['stage'],'at_utc':utc(self.clock())})
+                failure={'type':type(error).__name__,'stage':self.state['stage'],'at_utc':utc(self.clock())}
+                if isinstance(error,MatchContractError):failure['diagnostics']=error.diagnostics
+                self.state['failures'].append(failure)
                 self.save();raise
     def export(self):
         with writer_lock(self.lock_path):

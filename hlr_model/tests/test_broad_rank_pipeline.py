@@ -9,10 +9,11 @@ import pytest
 import requests
 from hlr_model.broad_rank_pipeline import (
     BroadConfig,BroadCollector,DiskState,DurableClient,ContractError,FrameExhausted,
-    writer_lock,hashed,TIERS,QUEUE,valid_entries,atomic_write,
+    writer_lock,hashed,TIERS,QUEUE,valid_entries,atomic_write,MatchContractError,
+    AbortedMatch,aborted_before_start,match_issues,
 )
 from hlr_model.longitudinal_pipeline import Config
-from hlr_model.riot_api_helpers import AuthenticationError
+from hlr_model.riot_api_helpers import AuthenticationError,MatchStore
 
 @pytest.fixture(autouse=True)
 def no_live_network(monkeypatch):
@@ -50,6 +51,16 @@ def payload(mid,uid,start,end=None,patch='16.19.1',extra=()):
             'win':i<5,'teamId':100 if i<5 else 200,'teamPosition':['TOP','JUNGLE','MIDDLE','BOTTOM','UTILITY'][i%5]})
     return {'metadata':{'matchId':mid,'participants':ids},'info':{'participants':participants,'queueId':420,
         'gameVersion':patch,'gameStartTimestamp':start,'gameEndTimestamp':end or start+30000}}
+
+def aborted_payload(mid,uid):
+    """Sanitized shape of the controlled NA1_5497782663 HTTP-200 response.
+
+    Player IDs are synthetic. The match never started and has no player outcomes.
+    """
+    value=payload(mid,uid,1)
+    value['info'].update(participants=[],gameVersion='',gameStartTimestamp=0,
+        gameEndTimestamp=1771730120708,gameDuration=0,endOfGameResult='Abort_Unexpected')
+    return value
 
 def collector(tmp_path,http,*,cfg=None,clock=None,enabled=True,legacy=None,excluded=()):
     clock=clock or Clock()
@@ -353,3 +364,128 @@ def test_multi_player_cohort_order_and_export_survive_restart(tmp_path):
     assert [p['puuid'] for p in resumed.completed()]==expected
     assert resumed.export()==first
     assert pd.read_parquet(first/'player_cohort.parquet').puuid.tolist()==expected
+
+def test_observed_abort_explains_original_failure_and_is_not_a_player_record():
+    from hlr_model.longitudinal_pipeline import player_record
+    mid='NA1_5497782663';value=aborted_payload(mid,'p')
+    assert not bool(value['info']['gameVersion'])  # First failing old predicate.
+    assert not MatchStore.valid(value,mid)
+    assert not BroadCollector.valid_match(value,mid)
+    assert player_record(value,'p') is None
+    assert aborted_before_start(value,mid,'p')
+    assert BroadCollector.validate_record(value,mid,'p')
+    fields={x['field']:x for x in match_issues(value,mid,'p')}
+    assert fields['info.gameVersion']['actual_type']=='str'
+    assert fields['info.gameVersion']['length']==0
+    assert fields['info.participants']['length']==0
+    assert 'info.gameStartTimestamp' in fields
+
+@pytest.mark.parametrize('section,field,bad',[
+    ('info','endOfGameResult','GameComplete'),
+    ('info','endOfGameResult','Abort_TooFewPlayers'),
+    ('info','gameVersion','16.19.1'),
+    ('info','gameStartTimestamp',None),('info','gameStartTimestamp',False),
+    ('info','gameStartTimestamp',1),('info','gameDuration',1),
+    ('info','gameEndTimestamp',0),('info','queueId',None),
+    ('metadata','matchId','NA1_999'),('metadata','participants',[]),
+])
+def test_partial_or_mismatched_responses_are_not_inferred_to_be_aborted(section,field,bad):
+    mid='NA1_5497782663';value=aborted_payload(mid,'p');value[section][field]=bad
+    assert not aborted_before_start(value,mid,'p')
+    with pytest.raises(MatchContractError):BroadCollector.validate_record(value,mid,'p')
+
+def test_abort_during_history_is_checkpointed_once_and_same_player_resumes(tmp_path):
+    api=FixtureAPI();target,aborted,valid=api.ids_for('p');older='NA1_900'
+    api.payloads[aborted]=aborted_payload(aborted,'p')
+    api.payloads[older]=payload(older,'p',api.anchor-300000)
+    http=HTTP(lambda u,p:KeyboardInterrupt() if u.endswith('/'+valid) else api(u,p))
+    run=collector(tmp_path,http)
+    with pytest.raises(KeyboardInterrupt):run.collect()
+    p=run.state['players']['p'];frozen=run.state['candidate_order']
+    assert p['history_query']['page_index']==1
+    assert p['history_exclusions']=={'aborted_before_start':1}
+    assert p['history_ids']==[] and not p.get('history_complete')
+    assert p['status']=='incomplete' and run.state['cursor']['BRONZE']==0
+    assert run.state['selected']['BRONZE']==['p']
+    saved_target=(run.roots[0]/(target+'.json')).read_bytes()
+    assert json.loads((run.roots[0]/(aborted+'.json')).read_text())==api.payloads[aborted]
+    run.close();http.handler=api
+    resumed=collector(tmp_path,http,enabled=None);resumed.collect()
+    p=resumed.completed()[0]
+    assert resumed.done and list(resumed.state['players'])==['p']
+    assert resumed.state['candidate_order']==frozen
+    assert p['history_ids']==[valid,older] and p['history_exclusions']=={'aborted_before_start':1}
+    assert not p['history_exhausted'] and p['history_stop_reason']=='historical_depth_reached'
+    assert len([u for u,_ in http.calls if u.endswith('/'+aborted)])==1
+    assert (resumed.roots[0]/(target+'.json')).read_bytes()==saved_target
+    assert resumed.record(aborted,'p') is None  # Never exported as an outcome.
+
+def test_abort_saved_before_checkpoint_is_reused_without_new_http(tmp_path,monkeypatch):
+    import hlr_model.broad_rank_pipeline as module
+    api=FixtureAPI();mid=api.ids_for('p')[1];api.payloads[mid]=aborted_payload(mid,'p')
+    http=HTTP(api);run=collector(tmp_path,http);original=module.atomic_write
+    def interrupt(path,value):
+        original(path,value)
+        if Path(path).stem==mid:raise KeyboardInterrupt
+    monkeypatch.setattr(module,'atomic_write',interrupt)
+    with pytest.raises(KeyboardInterrupt):run.collect()
+    p=run.state['players']['p']
+    assert p['history_query']['page_index']==0 and p['history_exclusions']=={}
+    run.close();monkeypatch.setattr(module,'atomic_write',original)
+    resumed=collector(tmp_path,http,enabled=None);resumed.collect()
+    assert resumed.done and resumed.completed()[0]['history_exclusions']=={'aborted_before_start':1}
+    assert len([u for u,_ in http.calls if u.endswith('/'+mid)])==1
+    assert resumed.completed()[0]['history_exhausted']  # Only a real short ID page establishes exhaustion.
+
+def test_unusable_response_reports_only_safe_fields_and_keeps_exact_pending_item(tmp_path):
+    api=FixtureAPI();mid=api.ids_for('p')[1];secret='SENTINEL_NEVER_LOG'
+    bad=api.payloads[mid];bad['metadata']['matchId']=secret
+    bad['info']['participants'][0]['win']=secret
+    bad['unexpected_arbitrary_key_'+secret]={'X-Riot-Token':secret}
+    http=HTTP(api);run=collector(tmp_path,http)
+    with pytest.raises(MatchContractError) as exc:run.collect()
+    assert mid in str(exc.value) and secret not in str(exc.value)
+    fields={x['field']:x for x in exc.value.diagnostics['issues']}
+    assert fields['metadata.matchId']['actual_type']=='str'
+    assert fields['info.participants[0].win']['expected']=='boolean'
+    p=run.state['players']['p']
+    assert p['status']=='incomplete' and not p.get('history_complete')
+    assert p['history_query']['page_index']==0 and p['history_query']['offset']==0
+    assert not p['history_ids'] and not p['history_exclusions'] and not run.done
+    assert run.state['cursor']['BRONZE']==0 and run.state['selected']['BRONZE']==['p']
+    assert run.disk.get('state')['failures'][-1]['diagnostics']==exc.value.diagnostics
+    assert secret not in json.dumps(run.disk.get('state'))
+    assert not (run.roots[0]/(mid+'.json')).exists()
+    api.payloads[mid]=payload(mid,'p',api.anchor-100000)
+    run.close();resumed=collector(tmp_path,http,enabled=None);resumed.collect()
+    assert resumed.done and list(resumed.state['players'])==['p']
+
+@pytest.mark.parametrize('bad',[
+    None,[],{'info':[],'metadata':{}},
+    {'metadata':{'matchId':'NA1_1'},'info':{'gameVersion':'16.19','participants':[None]}},
+    {'metadata':{'matchId':'NA1_1','participants':[{}]},
+     'info':{'gameVersion':'16.19','participants':[{'puuid':[]}]}},
+])
+def test_malformed_shapes_raise_safe_contract_error_instead_of_python_type_errors(bad):
+    with pytest.raises(MatchContractError):BroadCollector.validate_record(bad,'NA1_1','p')
+
+def test_normal_missing_end_timestamp_uses_duration_and_unknown_fields_are_allowed():
+    value=payload('NA1_1','p',1000)
+    del value['info']['gameEndTimestamp'];value['info']['gameDuration']=20
+    value['new_riot_field']={'arbitrary':'extra'}
+    assert BroadCollector.validate_record(value,'NA1_1','p')
+
+def test_aborted_target_never_becomes_an_outcome_or_replaces_player(tmp_path):
+    api=FixtureAPI();target=api.ids_for('p')[0];aborted='NA1_5497782663'
+    api.payloads[aborted]=aborted_payload(aborted,'p')
+    def handler(url,params):
+        if '/by-puuid/p/ids' in url and params['startTime']==api.cfg.study.target_search_start:
+            return [aborted,target][params['start']:params['start']+params['count']]
+        return api(url,params)
+    run=collector(tmp_path,HTTP(handler));run.collect()
+    p=run.completed()[0]
+    assert run.done and list(run.state['players'])==['p']
+    assert p['target_ids']==[target] and p['target_checked']==[aborted,target]
+    assert p['target_exclusions']=={'aborted_before_start':1}
+    out=run.export();model=pd.read_parquet(out/'longitudinal_modeling.parquet')
+    assert model.match_id.tolist()==[target]
