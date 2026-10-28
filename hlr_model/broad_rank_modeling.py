@@ -552,12 +552,15 @@ def fit_one(train, design, out, config, *, grouped):
         from pyro.infer import MCMC,NUTS
     except ImportError as error:
         raise RuntimeError('Fitting requires pyro-ppl==1.9.2 in this notebook environment. No package was installed and no approximation was substituted.') from error
+    require(pyro.__version__ == '1.9.2', f'Exact pyro-ppl==1.9.2 required; found {pyro.__version__}.')
     previous_threads=torch.get_num_threads()
     from hlr_model.tradeoff_helpers import rank_mcmc_diagnostics
     settings=config.sampling
     model='grouped' if grouped else 'shared'
     out=Path(out)/'fits'/model;out.mkdir(parents=True,exist_ok=True)
     manifest=dict(schema=SCHEMA,model=model,inference='Pyro NUTS',backend_version=pyro.__version__,
+        torch_version=torch.__version__,torch_threads=config.torch_threads,
+        sampler_source_sha256=sha(inspect.getsource(fit_one).encode()),
         sampling=settings,seed=config.seed,target_accept=config.target_accept,
         training_sha256=sha(train.to_json(orient='split',index=False).encode()),
         design=design.metadata(),model_source_sha256=sha(inspect.getsource(pyro_model).encode()))
@@ -571,6 +574,7 @@ def fit_one(train, design, out, config, *, grouped):
     torch.set_num_threads(config.torch_threads)
     try:
         for chain in range(settings['chains']):
+            print(f'{model}: chain {chain+1}/{settings["chains"]}', flush=True)
             sample_file=out/f'chain_{chain}.npz';info_file=out/f'chain_{chain}.json'
             if sample_file.is_file() and info_file.is_file():
                 info=json.loads(info_file.read_text())
@@ -581,7 +585,10 @@ def fit_one(train, design, out, config, *, grouped):
                        'log_sigma_player','log_sigma_pc','log_sigma_champion']
                 if grouped:small+=['log_sigma_group','group_free']
                 kernel=NUTS(pyro_model,target_accept_prob=config.target_accept,
-                            max_tree_depth=settings['max_tree_depth'],full_mass=[tuple(small)],jit_compile=False)
+                            max_tree_depth=settings['max_tree_depth'],full_mass=[tuple(small)],
+                            # 25 smoke warmup steps cannot estimate the dense mass block reliably.
+                            # Retain full mass adaptation for the 600-step full profile.
+                            adapt_mass_matrix=config.profile=='full',jit_compile=False)
                 sampler=MCMC(kernel,num_samples=settings['draws'],warmup_steps=settings['warmup'],num_chains=1,disable_progbar=False)
                 tick=time.perf_counter();sampler.run(data,dimensions,grouped=grouped)
                 values={k:v.detach().cpu().numpy() for k,v in sampler.get_samples().items()}
@@ -592,8 +599,14 @@ def fit_one(train, design, out, config, *, grouped):
                           acceptance_rate=float(diagnostics['acceptance rate']['chain 0']),
                           samples_sha256=sha(sample_file.read_bytes()))
                 atomic_json(info_file,info)
-            with np.load(sample_file) as archive:chain_samples.append({k:archive[k] for k in archive.files})
+            with np.load(sample_file) as archive:
+                values={k:archive[k] for k in archive.files}
+            require(values and all(v.shape[0] == settings['draws'] and np.isfinite(v).all()
+                                   for v in values.values()), 'Invalid retained chain shapes or nonfinite draws.')
+            chain_samples.append(values)
             infos.append(info)
+            print(f'{model}: chain {chain+1} saved/verified; divergences={info["divergences"]}, '
+                  f'acceptance={info["acceptance_rate"]:.3f}', flush=True)
     finally:
         torch.set_num_threads(previous_threads)
     samples={k:np.stack([s[k] for s in chain_samples]) for k in chain_samples[0]}
@@ -696,12 +709,19 @@ def comparison_pairs(prepared):
                     reference=reference,reference_champion_id=int(cid),alternative_champion_id=int(candidate.model_champion_id),
                     reference_experience=ref.n_recorded,alternative_experience=candidate.n_recorded,
                     reference_group=ref.mastery_group,alternative_group=candidate.mastery_group,
+                    reference_historical_wr=ref.historical_wr_beta11,alternative_historical_wr=candidate.historical_wr_beta11,
+                    reference_raw_matchup_probability=ref.matchup_probability,
+                    alternative_raw_matchup_probability=candidate.matchup_probability,
                     raw_matchup_advantage_pp=100*(candidate.matchup_probability-ref.matchup_probability)))
     return pd.DataFrame(records),pd.DataFrame(left,columns=columns),pd.DataFrame(right,columns=columns)
 
 
 def recommendations(prepared, results):
     pairs,reference,alternative=comparison_pairs(prepared)
+    train=prepared['played'].loc[prepared['played'].split.eq('train')&prepared['played'].usable_data]
+    pc_counts=train.groupby(['puuid','model_champion_id']).size()
+    champion_counts=train.groupby('model_champion_id').size()
+    group_players=train.groupby('mastery_group').puuid.nunique()
     output=[]
     for name,result in results.items():
         draws=flatten_draws(result)
@@ -720,6 +740,12 @@ def recommendations(prepared, results):
                 batch['point_prefers_alternative']=batch.difference_pp.gt(0)
                 batch['reference_pc_training_supported']=[(p,int(c)) in result['design'].pci for p,c in zip(r.puuid,r.model_champion_id)]
                 batch['alternative_pc_training_supported']=[(p,int(c)) in result['design'].pci for p,c in zip(a.puuid,a.model_champion_id)]
+                for prefix,choice in [('reference',r),('alternative',a)]:
+                    batch[prefix+'_pc_training_games']=[int(pc_counts.get((p,int(c)),0)) for p,c in zip(choice.puuid,choice.model_champion_id)]
+                    batch[prefix+'_champion_training_games']=[int(champion_counts.get(int(c),0)) for c in choice.model_champion_id]
+                    batch[prefix+'_group_training_players']=[int(group_players.get(g,0)) for g in choice.mastery_group]
+                    batch[prefix+'_sparse_training_support']=(batch[prefix+'_pc_training_games'].lt(5)
+                        |batch[prefix+'_champion_training_games'].lt(20)|batch[prefix+'_group_training_players'].lt(5))
                 output.append(batch)
     if not output:return pd.DataFrame(),pd.DataFrame()
     frame=pd.concat(output,ignore_index=True);summaries=[]
@@ -792,27 +818,77 @@ def run_modeling(prepared, study_metadata, out, config, *, enabled=False):
     if config.profile=='smoke':
         print('SMOKE ONLY: same likelihood/inference method on a small training subset. No primary performance or recommendation conclusions are produced.')
         return results
-    atomic_json(Path(out)/'evaluation_freeze.json',dict(created_at=stamp(),training_rows=len(train),
+    freeze=Path(out)/'evaluation_freeze.json'
+    if not freeze.exists():atomic_json(freeze,dict(created_at=stamp(),training_rows=len(train),
         models=['shared','grouped'],preprocessing='identical training-only design',refit_on_heldout=False,
         inference='NUTS; both models passed convergence gate',validation_start=config.validation_start,test_start=config.test_start))
+    validation=evaluate_split(prepared,results,out,split='validation')
+    return dict(results=results,**validation)
+
+
+def evaluate_split(prepared, results, out, *, split):
+    """Score one frozen held-out period; verified completed outputs are reused."""
+    require(split in ('validation','test'), 'Choose one held-out period.')
+    require(set(results)=={'shared','grouped'} and all(r['status']=='converged' for r in results.values()),
+            'Both full models must pass diagnostics before scoring.')
+    out=Path(out)
+    require(split!='test' or (out/'validation_decision.json').is_file(),
+            'Record the validation comparison and model decision before opening test outcomes.')
+    files=[f'{split}_metrics.csv',f'{split}_calibration.csv',f'{split}_predictions.parquet']
+    heldout=prepared['played'].loc[prepared['played'].split.eq(split)&prepared['played'].usable_data]
+    require(len(heldout)>0,'No usable held-out rows; do not claim a successful evaluation.')
+    identity=dict(rows_sha256=sha(heldout.to_json(orient='split',index=False).encode()),
+        helper_sha256=sha(Path(__file__).read_bytes()),
+        posterior={name:{'design':r['design'].metadata(),'samples':{
+            k:sha(np.ascontiguousarray(v).tobytes()) for k,v in r['samples'].items()}}
+            for name,r in results.items()})
+    identity=json.loads(canonical(identity))
+    manifest=out/f'{split}_evaluation.json'
+    if manifest.is_file():
+        saved=json.loads(manifest.read_text())
+        require(saved['identity']==identity,'Held-out evaluation inputs or frozen fit changed.')
+        require(all(sha((out/n).read_bytes())==h for n,h in saved['output_sha256'].items()),
+                'Held-out output checksum mismatch.')
+        return dict(metrics=pd.read_csv(out/files[0]),calibration=pd.read_csv(out/files[1]),
+                    predictions=pd.read_parquet(out/files[2]))
     scores=[];calibrations=[];predictions=[]
-    for split in ('validation','test'):
-        heldout=prepared['played'].loc[prepared['played'].split.eq(split)&prepared['played'].usable_data]
-        require(len(heldout)>0,'No usable held-out rows; do not claim a successful evaluation.')
-        for name,result in results.items():
-            for mode in ('general','personalized'):
-                probability=posterior_mean(result,heldout.drop(columns='win'),mode)
-                score,calibration=evaluate(heldout,probability,name,mode,split)
-                scores.append(score);calibrations.append(calibration)
-                f=heldout[KEY+['target_row_id']].copy();f['probability']=probability
-                f['model']=name;f['mode']=mode;f['split']=split;predictions.append(f)
+    for name,result in results.items():
+        for mode in ('general','personalized'):
+            probability=posterior_mean(result,heldout.drop(columns='win'),mode)
+            score,calibration=evaluate(heldout,probability,name,mode,split)
+            scores.append(score);calibrations.append(calibration)
+            f=heldout[KEY+['target_row_id']].copy();f['probability']=probability
+            f['model']=name;f['mode']=mode;f['split']=split;predictions.append(f)
     metrics=pd.DataFrame(scores);calibration=pd.concat(calibrations,ignore_index=True)
+    predictions=pd.concat(predictions,ignore_index=True)
+    metrics.to_csv(out/files[0],index=False);calibration.to_csv(out/files[1],index=False)
+    predictions.to_parquet(out/files[2],index=False)
+    atomic_json(manifest,dict(created_at=stamp(),identity=identity,
+        output_sha256={n:sha((out/n).read_bytes()) for n in files}))
+    return dict(metrics=metrics,calibration=calibration,predictions=predictions)
+
+
+def finalize_modeling(prepared, model_results, out, config, *, decision):
+    """Freeze a reviewed validation decision, then score final test and report curves/pairs."""
+    require(config.profile=='full' and bool(decision.strip()),'A full fit and written validation decision are required.')
+    out=Path(out);results=model_results['results']
+    validation=evaluate_split(prepared,results,out,split='validation')
+    record=dict(decision=decision,validation_sha256=sha((out/'validation_evaluation.json').read_bytes()),
+                config=asdict(config),models=['shared','grouped'],selection_uses_test=False)
+    record=json.loads(canonical(record));file=out/'validation_decision.json'
+    if file.exists():require(json.loads(file.read_text())['record']==record,'The pre-test decision is already frozen.')
+    else:atomic_json(file,dict(created_at=stamp(),record=record))
+    test=evaluate_split(prepared,results,out,split='test')
+    metrics=pd.concat([validation['metrics'],test['metrics']],ignore_index=True)
+    calibration=pd.concat([validation['calibration'],test['calibration']],ignore_index=True)
+    predictions=pd.concat([validation['predictions'],test['predictions']],ignore_index=True)
     metrics.to_csv(Path(out)/'evaluation_metrics.csv',index=False)
     calibration.to_csv(Path(out)/'calibration.csv',index=False)
-    pd.concat(predictions,ignore_index=True).to_parquet(Path(out)/'heldout_predictions.parquet',index=False)
+    predictions.to_parquet(Path(out)/'heldout_predictions.parquet',index=False)
     pairs,summary=recommendations(prepared,results)
     pairs.to_parquet(Path(out)/'paired_recommendations.parquet',index=False)
     summary.to_csv(Path(out)/'recommendation_summary.csv',index=False)
+    train=prepared['played'].loc[prepared['played'].split.eq('train')&prepared['played'].usable_data]
     curve_outputs(train,results,out)
     import matplotlib.pyplot as plt
     fig,ax=plt.subplots(figsize=(6,5))

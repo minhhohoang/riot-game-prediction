@@ -254,6 +254,13 @@ def test_matched_postfit_outputs_with_mocked_draws_use_no_fitter_or_sampler(tmp_
     monkeypatch.setattr(m,'fit_one',fake_fit)
     (tmp_path/'figures').mkdir()
     result=m.run_modeling(dict(played=played,alternatives=alt),dict(modeling_ready=True),tmp_path,m.Config(),enabled=True)
+    assert len(result['metrics'])==4 and result['metrics'].split.eq('validation').all()
+    assert not (tmp_path/'test_evaluation.json').exists()
+    assert not (tmp_path/'paired_recommendations.parquet').exists()
+    with pytest.raises(ValueError,match='Record the validation'):
+        m.evaluate_split(dict(played=played),result['results'],tmp_path,split='test')
+    result=m.finalize_modeling(dict(played=played,alternatives=alt),result,tmp_path,m.Config(),
+        decision='Synthetic validation fixture: retain both fixed specifications for final comparison.')
     assert len(result['metrics'])==8  # 2 models × 2 prediction quantities × 2 held-out periods.
     assert result['metrics'].rows.eq(4).all()
     pairs=pd.read_parquet(tmp_path/'paired_recommendations.parquet')
@@ -265,3 +272,8 @@ def test_matched_postfit_outputs_with_mocked_draws_use_no_fitter_or_sampler(tmp_
     assert set(curves['group'])=={'A','J','Unclassified'}
     assert (tmp_path/'figures/test_calibration.png').is_file()
     assert (tmp_path/'modeling_complete.json').is_file()
+    monkeypatch.setattr(m,'posterior_mean',lambda *a,**kw:pytest.fail('Completed test must reuse verified predictions'))
+    m.evaluate_split(dict(played=played),result['results'],tmp_path,split='test')
+    with (tmp_path/'test_metrics.csv').open('a') as f:f.write('\ntampered')
+    with pytest.raises(ValueError,match='checksum mismatch'):
+        m.evaluate_split(dict(played=played),result['results'],tmp_path,split='test')

@@ -1,0 +1,11 @@
+# Execution environment for broad_rank_modeling.ipynb (Python 3.12).
+# The project .venv-modeling inherits the existing base torch installation.
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.13.1
+scikit-learn==1.9.1
+matplotlib==3.9.2
+openpyxl==3.1.5
+pyarrow==17.0.0
+torch==2.15.0
+pyro-ppl==1.9.2
