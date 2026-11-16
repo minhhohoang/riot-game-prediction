@@ -4,13 +4,13 @@
 
 ## Overview
 
-When does champion familiarity outweigh a stronger matchup alternative in League of Legends? This completed project compares a player's recorded main with champions offering better published matchup rates, while quantifying uncertainty. The presentation provides the detailed analysis.
+When does champion familiarity outweigh a stronger matchup alternative in League of Legends? This completed project compares a player's recorded main with champions offering better published matchup rates. The presentation provides the detailed analysis.
 
 ## Approach
 
 Riot API Ranked Solo/Duo player-games from patch 16.19 are joined with LoLalytics Global matchup benchmarks. The Master-labeled cohort uses Master+ benchmarks; the Bronze–Diamond cohort uses exact-tier benchmarks.
 
-Bayesian hierarchical logistic regression accounts for prior champion experience and win rate, player and champion differences, role, and rank where applicable. Shared and mastery-group experience specifications are compared. The final reanalysis requires at least 50 verified external games per observed matchup and per compared choice, preserving chronological training, validation, and test splits.
+Bayesian hierarchical logistic regression accounts for prior champion experience and win rate, player and champion differences, role, and rank where applicable. The final reanalysis requires at least 50 verified external games per observed matchup and per compared choice, preserving chronological training, validation, and test splits.
 
 A main is the most-played champion in strictly prior, all-role recorded history. Eligible alternatives face the same opponent champion in the same role and have a strictly higher raw matchup rate; zero recorded champion experience remains eligible.
 
@@ -23,7 +23,7 @@ Using the **grouped model in personalized mode**, “favors” means a higher po
 | Main | Best eligible alternative (Rule B) | 60.8% | 54.2% |
 | Alternative | Recorded main | 36.0% | 58.8% |
 
-Percentages are conditional on each row's actual choice and cohort among eligible test player-games. Both options require valid pregame features and at least 50 verified external matchup games, and the alternative must have a strictly better raw matchup. The second row compares the actual non-main pick directly with the recorded main, without Rule B selection. These are model-based preference rates, not champions' predicted win probabilities or evidence that switching improves outcomes.
+Percentages are conditional on actual choice and cohort among eligible test player-games. Rule B applies only to the first row; the second compares the actual non-main pick with the recorded main. These are model-based preference rates, not predicted win probabilities or causal effects.
 
 ## Explore the project
 
