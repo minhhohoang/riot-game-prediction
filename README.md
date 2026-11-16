@@ -20,10 +20,10 @@ Using the **grouped model in personalized mode**, “favors” means a higher po
 
 | Actual champion chosen | Model favors | Master | Bronze–Diamond |
 | --- | --- | --- | --- |
-| Main | Best eligible alternative (Rule B) | 60.8% (206/339) | 54.2% (143/264) |
-| Alternative | Recorded main | 36.0% (71/197) | 58.8% (124/211) |
+| Main | Best eligible alternative (Rule B) | 60.8% | 54.2% |
+| Alternative | Recorded main | 36.0% | 58.8% |
 
-Percentages are conditional on each row's actual choice and cohort; fractions count eligible test player-games. Both options require valid pregame features and at least 50 verified external matchup games, and the alternative must have a strictly better raw matchup. The second row compares the actual non-main pick directly with the recorded main, without Rule B selection. These are model-based preference rates, not champions' predicted win probabilities or evidence that switching improves outcomes.
+Percentages are conditional on each row's actual choice and cohort among eligible test player-games. Both options require valid pregame features and at least 50 verified external matchup games, and the alternative must have a strictly better raw matchup. The second row compares the actual non-main pick directly with the recorded main, without Rule B selection. These are model-based preference rates, not champions' predicted win probabilities or evidence that switching improves outcomes.
 
 ## Explore the project
 
