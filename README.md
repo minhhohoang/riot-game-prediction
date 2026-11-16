@@ -16,14 +16,14 @@ A main is the most-played champion in strictly prior, all-role recorded history.
 
 ## Key findings
 
-For the primary shared model's personalized predictions, the table compares each main with the eligible alternative having the highest raw matchup rate. Denominators are eligible test-period player-games where the player actually picked their main:
+Using the **grouped model in personalized mode**, “favors” means a higher posterior mean win probability. Rule B selects the eligible alternative with the highest model-predicted win probability.
 
-| Cohort | Alternative has higher mean predicted win probability | Uncertain comparison |
-| --- | --- | --- |
-| Master-labeled | 139/339 (41.0%) | 333/339 (98.2%) |
-| Bronze–Diamond | 121/264 (45.8%) | 263/264 (99.6%) |
+| Actual champion chosen | Model favors | Master | Bronze–Diamond |
+| --- | --- | --- | --- |
+| Main | Best eligible alternative (Rule B) | 60.8% (206/339) | 54.2% (143/264) |
+| Alternative | Recorded main | 36.0% (71/197) | 58.8% (124/211) |
 
-Uncertain means the paired 95% credible interval for the predicted difference includes zero. Player-games are focal-player records, not unique matches. These predictions do not establish that switching champions improves outcomes.
+Percentages are conditional on each row's actual choice and cohort; fractions count eligible test player-games. Both options require valid pregame features and at least 50 verified external matchup games, and the alternative must have a strictly better raw matchup. The second row compares the actual non-main pick directly with the recorded main, without Rule B selection. These are model-based preference rates, not champions' predicted win probabilities or evidence that switching improves outcomes.
 
 ## Explore the project
 
